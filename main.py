@@ -1,4 +1,5 @@
 import argparse
+import copy
 import os
 import random
 from dataclasses import dataclass
@@ -10,16 +11,24 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATConv, GCNConv
 from torch_geometric.transforms import NormalizeFeatures
-from torch_geometric.utils import add_self_loops, remove_self_loops, to_undirected
+from torch_geometric.utils import add_remaining_self_loops, remove_self_loops, to_undirected
 
 EPS = 1e-12
 
 
-def set_seed(seed: int) -> None:
+def set_seed(seed: int, deterministic: bool = False) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        try:
+            torch.use_deterministic_algorithms(True)
+        except Exception:
+            pass
 
 
 @torch.no_grad()
@@ -47,6 +56,11 @@ def ece_score(probs: torch.Tensor, y: torch.Tensor, mask: torch.Tensor, n_bins: 
     return ece.item()
 
 
+@torch.no_grad()
+def nll_loss(probs: torch.Tensor, y: torch.Tensor, mask: torch.Tensor) -> float:
+    return F.nll_loss(torch.log(probs[mask].clamp(min=EPS)), y[mask]).item()
+
+
 def get_split_masks(data, split_idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     train_mask = data.train_mask
     val_mask = data.val_mask
@@ -56,6 +70,16 @@ def get_split_masks(data, split_idx: int) -> Tuple[torch.Tensor, torch.Tensor, t
     if split_idx < 0 or split_idx >= train_mask.size(1):
         raise ValueError(f"split_idx={split_idx} out of range for mask shape {train_mask.shape}")
     return train_mask[:, split_idx], val_mask[:, split_idx], test_mask[:, split_idx]
+
+
+def dedup_edge_index(edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
+    src, dst = edge_index[0], edge_index[1]
+    key = src * num_nodes + dst
+    key_sorted, perm = torch.sort(key)
+    src, dst = src[perm], dst[perm]
+    mask = torch.ones_like(key_sorted, dtype=torch.bool)
+    mask[1:] = key_sorted[1:] != key_sorted[:-1]
+    return torch.stack([src[mask], dst[mask]], dim=0)
 
 
 def compute_reverse_edge(edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
@@ -77,14 +101,47 @@ def compute_reverse_edge(edge_index: torch.Tensor, num_nodes: int) -> torch.Tens
     return rev
 
 
-def load_dataset(name: str, root: str = "./data"):
+@torch.no_grad()
+def dropedge_undirected(
+    edge_index: torch.Tensor,
+    rev_edge: torch.Tensor,
+    drop_prob: float,
+    num_nodes: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if drop_prob <= 0:
+        return edge_index, rev_edge
+
+    device = edge_index.device
+    E = edge_index.size(1)
+    idx = torch.arange(E, device=device)
+    rev = rev_edge
+    rep = torch.minimum(idx, rev)
+
+    uniq_rep, inv = torch.unique(rep, sorted=False, return_inverse=True)
+
+    keep_pair = (torch.rand(uniq_rep.size(0), device=device) > drop_prob)
+
+    is_self = (edge_index[0] == edge_index[1])
+    if is_self.any():
+        self_pair_ids = torch.unique(inv[is_self])
+        keep_pair[self_pair_ids] = True
+
+    keep = keep_pair[inv]
+    ei = edge_index[:, keep]
+
+    rev2 = compute_reverse_edge(ei, num_nodes)
+    return ei, rev2
+
+
+def load_dataset(name: str, root: str = "./data", normalize_features: bool = True):
     name_raw = name
     name = name.lower()
-    transform = NormalizeFeatures()
+
+    transform = NormalizeFeatures() if normalize_features else None
+    is_webkb = name in ["texas", "wisconsin", "cornell"]
 
     if name in ["cora", "citeseer", "pubmed"]:
         from torch_geometric.datasets import Planetoid
-
         proper = {"cora": "Cora", "citeseer": "CiteSeer", "pubmed": "PubMed"}[name]
         dataset = Planetoid(root=os.path.join(root, proper), name=proper, split="public", transform=transform)
         data = dataset[0]
@@ -93,7 +150,6 @@ def load_dataset(name: str, root: str = "./data"):
     if name in ["chameleon", "squirrel"]:
         try:
             from torch_geometric.datasets import WikipediaNetwork
-
             dataset = WikipediaNetwork(
                 root=os.path.join(root, name_raw),
                 name=name,
@@ -105,10 +161,9 @@ def load_dataset(name: str, root: str = "./data"):
         except Exception as e:
             print(f"[WARN] WikipediaNetwork load failed ({e}). Trying fallback...")
 
-    if name in ["texas", "wisconsin", "cornell"]:
+    if is_webkb:
         try:
             from torch_geometric.datasets import WebKB
-
             dataset = WebKB(root=os.path.join(root, name_raw), name=name, transform=transform)
             data = dataset[0]
             return data, dataset.num_features, dataset.num_classes
@@ -117,7 +172,6 @@ def load_dataset(name: str, root: str = "./data"):
 
     try:
         from torch_geometric.datasets import HeterophilousGraphDataset
-
         dataset = HeterophilousGraphDataset(root=os.path.join(root, name_raw), name=name, transform=transform)
         data = dataset[0]
         return data, dataset.num_features, dataset.num_classes
@@ -151,17 +205,19 @@ class UnaryEncoder(nn.Module):
         dropout: float,
         encoder_type: str = "gat",
         gat_heads: int = 8,
+        input_dropout: float = 0.0,
     ):
         super().__init__()
         self.encoder_type = encoder_type
         self.dropout = dropout
+        self.input_dropout = float(input_dropout)
         self.hidden_dim = hidden_dim
         self.num_classes = num_classes
         self.gat_heads = gat_heads
 
         if encoder_type == "gcn":
-            self.conv1 = GCNConv(in_dim, hidden_dim, cached=True, normalize=True)
-            self.conv2 = GCNConv(hidden_dim, num_classes, cached=True, normalize=True)
+            self.conv1 = GCNConv(in_dim, hidden_dim, cached=False, normalize=True)
+            self.conv2 = GCNConv(hidden_dim, num_classes, cached=False, normalize=True)
             self.res1 = nn.Linear(in_dim, hidden_dim, bias=False)
             self.norm1 = nn.LayerNorm(hidden_dim)
         elif encoder_type == "gat":
@@ -179,6 +235,8 @@ class UnaryEncoder(nn.Module):
             raise ValueError(f"Unknown encoder_type={encoder_type}")
 
     def forward(self, x: torch.Tensor, edge_index: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = F.dropout(x, p=self.input_dropout, training=self.training)
+
         if self.encoder_type == "gcn":
             if edge_index is None:
                 raise ValueError("gcn encoder requires edge_index")
@@ -217,15 +275,6 @@ class InferenceConfig:
     T: int = 10
     eta: float = 0.2
     init_unary: bool = True
-    adaptive_outer: int = 1
-    eta_min: float = 0.05
-    eta_max: float = 0.8
-    use_cert: bool = False
-    cert_k: int = 10
-    cert_eps_fd: float = 1e-3
-    use_uncert: bool = False
-    hutch_samples: int = 4
-    hutch_eps_fd: float = 1e-3
     alpha_scale: float = 1.0
 
 
@@ -237,37 +286,41 @@ class CertBP(nn.Module):
         num_classes: int,
         edge_hidden_dim: int = 64,
         dropout: float = 0.6,
+        input_dropout: float = 0.0,
         w_max: float = 0.8,
         cmp_margin: float = 0.05,
         encoder_type: str = "gat",
         gat_heads: int = 8,
         alpha_max: float = 1.5,
-        mix_init: float = 0.98,
+        mix_init: float = 0.6,
+        msg_logit_init: float = -1.0,
+        exp_clip: float = 20.0,
+        feature_noise_std: float = 0.0,
+        unary_temp: float = 1.5,
     ):
         super().__init__()
         self.num_classes = num_classes
         self.w_max = w_max
         self.cmp_margin = cmp_margin
         self.alpha_max = alpha_max
+        self.exp_clip = float(exp_clip)
+        self.feature_noise_std = float(feature_noise_std)
+        self.unary_temp = float(max(unary_temp, 1e-3))
 
-        self.encoder = UnaryEncoder(in_dim, hidden_dim, num_classes, dropout, encoder_type=encoder_type, gat_heads=gat_heads)
+        self.encoder = UnaryEncoder(
+            in_dim, hidden_dim, num_classes, dropout,
+            encoder_type=encoder_type, gat_heads=gat_heads, input_dropout=input_dropout
+        )
         self.edge_mlp = MLP(in_dim=2 * hidden_dim + 2, hidden_dim=edge_hidden_dim, out_dim=1, dropout=dropout)
 
         self.R_raw = nn.Parameter(torch.empty(num_classes, num_classes))
         nn.init.xavier_uniform_(self.R_raw)
-        with torch.no_grad():
-            self.R_raw += 0.5 * torch.eye(num_classes)
 
         self.R_scale_log = nn.Parameter(torch.tensor(0.0))
-        self.msg_logit = nn.Parameter(torch.tensor(-3.0))
+        self.msg_logit = nn.Parameter(torch.tensor(float(msg_logit_init)))
 
         mix_init = float(min(max(mix_init, 1e-4), 1.0 - 1e-4))
         self.mix_logit = nn.Parameter(torch.tensor(np.log(mix_init / (1.0 - mix_init)), dtype=torch.float))
-
-        self.a_u = nn.Parameter(torch.tensor(0.01))
-        self.b_u = nn.Parameter(torch.tensor(0.0))
-        self.a_eta = nn.Parameter(torch.tensor(2.0))
-        self.b_eta = nn.Parameter(torch.tensor(0.0))
 
     def _msg_alpha(self, alpha_scale: float = 1.0) -> torch.Tensor:
         return (self.alpha_max * torch.sigmoid(self.msg_logit)) * float(alpha_scale)
@@ -276,11 +329,6 @@ class CertBP(nn.Module):
         R = 0.5 * (self.R_raw + self.R_raw.t())
         scale = F.softplus(self.R_scale_log) + 1e-6
         return scale * torch.tanh(R)
-
-    @staticmethod
-    def _centered_log(m: torch.Tensor) -> torch.Tensor:
-        logm = torch.log(m.clamp(min=EPS))
-        return logm - logm.mean(dim=-1, keepdim=True)
 
     def _edge_struct_features(self, edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
         src, dst = edge_index[0], edge_index[1]
@@ -299,7 +347,9 @@ class CertBP(nn.Module):
         w = self.w_max * torch.sigmoid(w_raw)
         w = 0.5 * (w + w[rev])
         R = self._sym_R()
-        K = torch.exp(w.view(-1, 1, 1) * R.view(1, R.size(0), R.size(1)))
+        arg = w.view(-1, 1, 1) * R.view(1, R.size(0), R.size(1))
+        arg = torch.clamp(arg, min=-self.exp_clip, max=self.exp_clip)
+        K = torch.exp(arg)
         return w, K
 
     def _edge_norm(self, edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
@@ -332,6 +382,7 @@ class CertBP(nn.Module):
 
         for _ in range(T):
             f = torch.bmm(m.unsqueeze(1), K).squeeze(1)
+            f = torch.nan_to_num(f, nan=1.0, posinf=1.0, neginf=1.0)
             log_f = torch.log(f.clamp(min=EPS))
             log_f = log_f * edge_norm.view(-1, 1)
 
@@ -364,6 +415,7 @@ class CertBP(nn.Module):
         edge_norm = self._edge_norm(edge_index, num_nodes).to(device)
 
         f = torch.bmm(m.unsqueeze(1), K).squeeze(1)
+        f = torch.nan_to_num(f, nan=1.0, posinf=1.0, neginf=1.0)
         log_f = torch.log(f.clamp(min=EPS))
         log_f = log_f * edge_norm.view(-1, 1)
 
@@ -373,125 +425,6 @@ class CertBP(nn.Module):
         log_b = log_phi + alpha * sum_in
         return torch.softmax(log_b, dim=-1)
 
-    def _F_undamped_map(
-        self,
-        u: torch.Tensor,
-        log_phi: torch.Tensor,
-        K: torch.Tensor,
-        edge_index: torch.Tensor,
-        rev: torch.Tensor,
-        num_nodes: int,
-        alpha_scale: float,
-    ) -> torch.Tensor:
-        device = u.device
-        src, dst = edge_index[0], edge_index[1]
-        C = u.size(1)
-        alpha = self._msg_alpha(alpha_scale)
-        edge_norm = self._edge_norm(edge_index, num_nodes).to(device)
-
-        m = torch.softmax(u, dim=-1)
-        f = torch.bmm(m.unsqueeze(1), K).squeeze(1)
-        log_f = torch.log(f.clamp(min=EPS))
-        log_f = log_f * edge_norm.view(-1, 1)
-
-        sum_in = torch.zeros((num_nodes, C), device=device)
-        sum_in.index_add_(0, dst, log_f)
-
-        excl = sum_in[src] - log_f[rev]
-        log_msg = log_phi[src] + alpha * excl
-        m_new = torch.softmax(log_msg, dim=-1)
-        return self._centered_log(m_new)
-
-    @torch.no_grad()
-    def _matvec_Jv_fd(
-        self,
-        u: torch.Tensor,
-        v: torch.Tensor,
-        log_phi: torch.Tensor,
-        K: torch.Tensor,
-        edge_index: torch.Tensor,
-        rev: torch.Tensor,
-        num_nodes: int,
-        eps_fd: float,
-        alpha_scale: float,
-    ) -> torch.Tensor:
-        Fu = self._F_undamped_map(u, log_phi, K, edge_index, rev, num_nodes, alpha_scale)
-        Fu2 = self._F_undamped_map(u + eps_fd * v, log_phi, K, edge_index, rev, num_nodes, alpha_scale)
-        return (Fu2 - Fu) / eps_fd
-
-    def _matvec_JtJv(
-        self,
-        u: torch.Tensor,
-        v: torch.Tensor,
-        log_phi: torch.Tensor,
-        K: torch.Tensor,
-        edge_index: torch.Tensor,
-        rev: torch.Tensor,
-        num_nodes: int,
-        eps_fd: float,
-        alpha_scale: float,
-    ) -> torch.Tensor:
-        u_var = u.detach().requires_grad_(True)
-        Fu = self._F_undamped_map(u_var, log_phi, K, edge_index, rev, num_nodes, alpha_scale)
-
-        with torch.no_grad():
-            Jv = self._matvec_Jv_fd(u.detach(), v.detach(), log_phi, K, edge_index, rev, num_nodes, eps_fd, alpha_scale)
-            y = Jv.detach()
-
-        scalar = (Fu * y).sum()
-        (grad_u,) = torch.autograd.grad(scalar, u_var, retain_graph=False, create_graph=False)
-        return grad_u.detach()
-
-    @torch.no_grad()
-    def estimate_delta_power(
-        self,
-        u_star: torch.Tensor,
-        log_phi: torch.Tensor,
-        K: torch.Tensor,
-        edge_index: torch.Tensor,
-        rev: torch.Tensor,
-        num_nodes: int,
-        k: int,
-        eps_fd: float,
-        alpha_scale: float,
-    ) -> float:
-        v = torch.randn_like(u_star)
-        v = v / (v.norm() + EPS)
-
-        for _ in range(k):
-            Av = self._matvec_JtJv(u_star, v, log_phi, K, edge_index, rev, num_nodes, eps_fd, alpha_scale)
-            n = Av.norm() + EPS
-            v = Av / n
-
-        Av = self._matvec_JtJv(u_star, v, log_phi, K, edge_index, rev, num_nodes, eps_fd, alpha_scale)
-        lam = (v * Av).sum().item() / ((v * v).sum().item() + EPS)
-        return float(1.0 - lam)
-
-    @torch.no_grad()
-    def hutchinson_diag_JJt(
-        self,
-        u_star: torch.Tensor,
-        log_phi: torch.Tensor,
-        K: torch.Tensor,
-        edge_index: torch.Tensor,
-        rev: torch.Tensor,
-        num_nodes: int,
-        samples: int,
-        eps_fd: float,
-        alpha_scale: float,
-    ) -> torch.Tensor:
-        Fu = self._F_undamped_map(u_star, log_phi, K, edge_index, rev, num_nodes, alpha_scale)
-        acc = torch.zeros_like(Fu)
-
-        for _ in range(samples):
-            z = torch.empty_like(u_star).bernoulli_(0.5)
-            z = z * 2.0 - 1.0
-            Fuz = self._F_undamped_map(u_star + eps_fd * z, log_phi, K, edge_index, rev, num_nodes, alpha_scale)
-            Jz = (Fuz - Fu) / eps_fd
-            acc += Jz * Jz
-
-        return acc / float(samples)
-
     def compatibility_prior(self) -> torch.Tensor:
         R = self._sym_R()
         diag = torch.diag(R).view(-1, 1)
@@ -500,104 +433,56 @@ class CertBP(nn.Module):
         mask = 1.0 - torch.eye(R.size(0), device=R.device)
         return F.relu(M) * mask
 
-    def forward(self, data, inf_cfg: InferenceConfig) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        x = data.x
-        edge_index = data.edge_index
-        rev = data.rev_edge
+    def forward(
+        self,
+        data,
+        inf_cfg: InferenceConfig,
+        edge_index: Optional[torch.Tensor] = None,
+        rev: Optional[torch.Tensor] = None,
+        x_override: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        x = data.x if x_override is None else x_override
+        if self.training and self.feature_noise_std > 0:
+            x = x + torch.randn_like(x) * self.feature_noise_std
+
+        ei = data.edge_index if edge_index is None else edge_index
+        r = data.rev_edge if rev is None else rev
         num_nodes = data.num_nodes
 
-        h, logits = self.encoder(x, edge_index)
-        log_phi = logits
+        h, logits = self.encoder(x, ei)
+        log_phi = F.log_softmax(logits / self.unary_temp, dim=-1)
 
-        struct = self._edge_struct_features(edge_index, num_nodes)
-        _, K = self._build_pairwise_kernel(h, edge_index, struct, rev)
+        struct = self._edge_struct_features(ei, num_nodes)
+        w, K = self._build_pairwise_kernel(h, ei, struct, r)
 
-        eta_used = inf_cfg.eta
-        m = None
+        m = self._bp_one_run(
+            log_phi=log_phi,
+            K=K,
+            edge_index=ei,
+            rev=r,
+            num_nodes=num_nodes,
+            T=inf_cfg.T,
+            eta=inf_cfg.eta,
+            init_unary=inf_cfg.init_unary,
+            alpha_scale=inf_cfg.alpha_scale,
+        )
 
-        for _ in range(max(1, inf_cfg.adaptive_outer)):
-            m = self._bp_one_run(
-                log_phi=log_phi,
-                K=K,
-                edge_index=edge_index,
-                rev=rev,
-                num_nodes=num_nodes,
-                T=inf_cfg.T,
-                eta=eta_used,
-                init_unary=inf_cfg.init_unary,
-                alpha_scale=inf_cfg.alpha_scale,
-            )
+        b = self._compute_beliefs(log_phi, K, ei, num_nodes, m, alpha_scale=inf_cfg.alpha_scale)
 
-            if inf_cfg.adaptive_outer > 1 and inf_cfg.use_cert:
-                u_star = self._centered_log(m).detach()
-                delta = self.estimate_delta_power(
-                    u_star=u_star,
-                    log_phi=log_phi.detach(),
-                    K=K.detach(),
-                    edge_index=edge_index,
-                    rev=rev,
-                    num_nodes=num_nodes,
-                    k=inf_cfg.cert_k,
-                    eps_fd=inf_cfg.cert_eps_fd,
-                    alpha_scale=inf_cfg.alpha_scale,
-                )
-                sig = torch.sigmoid(self.a_eta * torch.tensor(delta, device=x.device) + self.b_eta).item()
-                eta_used = inf_cfg.eta_min + (inf_cfg.eta_max - inf_cfg.eta_min) * sig
-
-        b = self._compute_beliefs(log_phi, K, edge_index, num_nodes, m, alpha_scale=inf_cfg.alpha_scale)
+        unary_probs = log_phi.exp()
+        mix = torch.sigmoid(self.mix_logit)
+        a = float(inf_cfg.alpha_scale)
+        mix_eff = 1.0 - (1.0 - mix) * a
+        probs = (1.0 - mix_eff) * b + mix_eff * unary_probs
+        probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=EPS)
 
         extras: Dict[str, torch.Tensor] = {
             "beliefs": b,
             "messages": m,
-            "eta_used": torch.tensor(eta_used, device=x.device),
             "alpha": self._msg_alpha(inf_cfg.alpha_scale).detach(),
-            "mix": torch.sigmoid(self.mix_logit).detach(),
+            "mix": mix.detach(),
+            "w": w if self.training else w.detach(),
         }
-
-        probs_bp = b
-
-        if inf_cfg.use_uncert:
-            u_star = self._centered_log(m).detach()
-            diag = self.hutchinson_diag_JJt(
-                u_star=u_star,
-                log_phi=log_phi.detach(),
-                K=K.detach(),
-                edge_index=edge_index,
-                rev=rev,
-                num_nodes=num_nodes,
-                samples=inf_cfg.hutch_samples,
-                eps_fd=inf_cfg.hutch_eps_fd,
-                alpha_scale=inf_cfg.alpha_scale,
-            )
-            src = edge_index[0]
-            node_u = torch.zeros((num_nodes,), device=x.device)
-            node_u.index_add_(0, src, diag.sum(dim=-1))
-            Tt = 1.0 + F.softplus(self.a_u * node_u + self.b_u)
-            logb = torch.log(b.clamp(min=EPS))
-            probs_bp = torch.softmax(logb / Tt.view(-1, 1), dim=-1)
-            extras["node_u"] = node_u
-            extras["T"] = Tt
-
-        if inf_cfg.use_cert:
-            u_star = self._centered_log(m).detach()
-            delta = self.estimate_delta_power(
-                u_star=u_star,
-                log_phi=log_phi.detach(),
-                K=K.detach(),
-                edge_index=edge_index,
-                rev=rev,
-                num_nodes=num_nodes,
-                k=inf_cfg.cert_k,
-                eps_fd=inf_cfg.cert_eps_fd,
-                alpha_scale=inf_cfg.alpha_scale,
-            )
-            extras["delta"] = torch.tensor(delta, device=x.device)
-
-        unary_probs = torch.softmax(log_phi, dim=-1)
-        mix = torch.sigmoid(self.mix_logit)
-        probs = (1.0 - mix) * probs_bp + mix * unary_probs
-        probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=EPS)
-
         return probs, extras
 
 
@@ -611,122 +496,20 @@ def nll_with_label_smoothing(probs: torch.Tensor, y: torch.Tensor, eps: float) -
 
 
 @torch.no_grad()
-def rw_norm(edge_index: torch.Tensor, num_nodes: int, device: torch.device) -> torch.Tensor:
-    dst = edge_index[1]
-    deg = torch.zeros((num_nodes,), device=device)
-    deg.index_add_(0, dst, torch.ones((dst.numel(),), device=device))
-    deg = deg.clamp(min=1.0)
-    return 1.0 / deg[dst]
-
-
-@torch.no_grad()
-def ppr_propagate(edge_index: torch.Tensor, x0: torch.Tensor, num_nodes: int, steps: int, alpha: float) -> torch.Tensor:
-    device = x0.device
-    edge_index2, _ = add_self_loops(edge_index, num_nodes=num_nodes)
-    src, dst = edge_index2[0], edge_index2[1]
-    norm = rw_norm(edge_index2, num_nodes, device).view(-1, 1)
-    x = x0
-    a = float(alpha)
-    for _ in range(int(steps)):
-        out = torch.zeros_like(x)
-        out.index_add_(0, dst, x[src] * norm)
-        x = (1.0 - a) * out + a * x0
-    return x
-
-
-@torch.no_grad()
-def correct_and_smooth(
-    probs: torch.Tensor,
-    y: torch.Tensor,
-    train_mask: torch.Tensor,
-    edge_index: torch.Tensor,
-    num_nodes: int,
-    num_classes: int,
-    correct_steps: int,
-    correct_alpha: float,
-    smooth_steps: int,
-    smooth_alpha: float,
-) -> torch.Tensor:
-    device = probs.device
-    Y = F.one_hot(y, num_classes=num_classes).float().to(device)
-
-    E = torch.zeros_like(probs)
-    E[train_mask] = Y[train_mask] - probs[train_mask]
-    E = ppr_propagate(edge_index, E, num_nodes, correct_steps, correct_alpha)
-    Z = probs + E
-    Z = Z.clamp(min=0.0)
-    Z = Z / Z.sum(dim=-1, keepdim=True).clamp(min=EPS)
-
-    edge_index2, _ = add_self_loops(edge_index, num_nodes=num_nodes)
-    src, dst = edge_index2[0], edge_index2[1]
-    norm = rw_norm(edge_index2, num_nodes, device).view(-1, 1)
-
-    base = Z
-    a = float(smooth_alpha)
-    for _ in range(int(smooth_steps)):
-        out = torch.zeros_like(Z)
-        out.index_add_(0, dst, Z[src] * norm)
-        Z = (1.0 - a) * out + a * base
-        Z[train_mask] = Y[train_mask]
-
-    Z = Z.clamp(min=0.0)
-    Z = Z / Z.sum(dim=-1, keepdim=True).clamp(min=EPS)
-    return Z
-
-
-@torch.no_grad()
-def tune_cs_params(
-    probs: torch.Tensor,
-    y: torch.Tensor,
-    train_mask: torch.Tensor,
-    val_mask: torch.Tensor,
-    edge_index: torch.Tensor,
-    num_nodes: int,
-    num_classes: int,
-) -> Tuple[int, float, int, float]:
-    correct_steps_list = [10, 20, 30, 50, 80]
-    correct_alpha_list = [0.1, 0.2, 0.3, 0.5, 0.7, 0.9]
-    smooth_steps_list = [10, 20, 30, 50, 80]
-    smooth_alpha_list = [0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
-    best_cs = 50
-    best_ca = 0.5
-    best_ss = 50
-    best_sa = 0.8
-    best_acc = -1.0
-    for cs in correct_steps_list:
-        for ca in correct_alpha_list:
-            for ss in smooth_steps_list:
-                for sa in smooth_alpha_list:
-                    out = correct_and_smooth(
-                        probs,
-                        y,
-                        train_mask,
-                        edge_index,
-                        num_nodes,
-                        num_classes,
-                        cs,
-                        ca,
-                        ss,
-                        sa,
-                    )
-                    acc = accuracy(out, y, val_mask)
-                    if acc > best_acc + 1e-12:
-                        best_acc = acc
-                        best_cs, best_ca, best_ss, best_sa = cs, ca, ss, sa
-    return best_cs, best_ca, best_ss, best_sa
-
-
-@torch.no_grad()
-def predict_probs(model: nn.Module, data, inf_cfg: InferenceConfig, mc_samples: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+def predict_probs(
+    model: nn.Module, data, inf_cfg: InferenceConfig, mc_samples: int,
+    edge_index: Optional[torch.Tensor] = None,
+    rev: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     if mc_samples <= 1:
         model.eval()
-        return model(data, inf_cfg)
+        return model(data, inf_cfg, edge_index=edge_index, rev=rev)
 
     probs_sum = None
     extras_last: Dict[str, torch.Tensor] = {}
     model.train()
     for _ in range(mc_samples):
-        p, ex = model(data, inf_cfg)
+        p, ex = model(data, inf_cfg, edge_index=edge_index, rev=rev)
         probs_sum = p if probs_sum is None else probs_sum + p
         extras_last = ex
     probs = probs_sum / float(mc_samples)
@@ -734,23 +517,81 @@ def predict_probs(model: nn.Module, data, inf_cfg: InferenceConfig, mc_samples: 
     return probs, extras_last
 
 
+@torch.no_grad()
+def apply_temperature_scaling(probs: torch.Tensor, T: float) -> torch.Tensor:
+    T = float(max(T, 1e-3))
+    logp = torch.log(probs.clamp(min=EPS))
+    return torch.softmax(logp / T, dim=-1)
+
+
+def fit_temperature(probs: torch.Tensor, y: torch.Tensor, mask: torch.Tensor, max_iter: int = 50) -> float:
+    device = probs.device
+    logp = torch.log(probs[mask].clamp(min=EPS))
+    yy = y[mask]
+
+    logT = torch.zeros([], device=device, requires_grad=True)
+    opt = torch.optim.LBFGS([logT], lr=0.5, max_iter=max_iter, line_search_fn="strong_wolfe")
+
+    def closure():
+        opt.zero_grad()
+        T = torch.exp(logT).clamp(min=1e-3, max=100.0)
+        p = torch.softmax(logp / T, dim=-1)
+        loss = F.nll_loss(torch.log(p.clamp(min=EPS)), yy)
+        loss.backward()
+        return loss
+
+    opt.step(closure)
+    return float(torch.exp(logT).detach().item())
+
+
 def train_one_run(args) -> None:
     device = torch.device(args.device)
+    set_seed(args.seed, deterministic=args.deterministic)
 
-    data, in_dim, num_classes = load_dataset(args.dataset, root=args.root)
+    data, in_dim, num_classes = load_dataset(args.dataset, root=args.root, normalize_features=args.normalize_features)
 
     edge_index, _ = remove_self_loops(data.edge_index)
     edge_index = to_undirected(edge_index, num_nodes=data.num_nodes)
+    edge_index, _ = add_remaining_self_loops(edge_index, num_nodes=data.num_nodes)
+    edge_index = dedup_edge_index(edge_index, data.num_nodes)
+
     data.edge_index = edge_index
     data.rev_edge = compute_reverse_edge(data.edge_index, data.num_nodes)
     data = data.to(device)
 
     train_mask, val_mask, test_mask = get_split_masks(data, args.split)
 
-    post = args.post
-    if post == "auto":
-        nm = args.dataset.lower()
-        post = "cs" if nm in ["cora", "citeseer", "pubmed"] else "none"
+    nm = args.dataset.lower()
+    is_webkb = nm in ["texas", "wisconsin", "cornell"]
+    is_planetoid = nm in ["cora", "citeseer", "pubmed"]
+
+    if args.auto_reg and is_webkb:
+        if args.encoder == "auto":
+            args.encoder = "mlp"
+        args.label_smoothing = max(args.label_smoothing, 0.1)
+        args.dropedge = max(args.dropedge, 0.2)
+        args.weight_decay = max(args.weight_decay, 5e-3)
+        args.lambda_alpha = max(args.lambda_alpha, 5e-3)
+        args.lambda_mix = max(args.lambda_mix, 0.1)
+        args.mix_target = 0.85
+        args.w_max = min(args.w_max, 0.4)
+        args.early_metric = "nll"
+        if args.post == "auto":
+            args.post = "ts"
+    else:
+        if args.encoder == "auto":
+            args.encoder = "gat"
+        if args.auto_reg and is_planetoid:
+            args.label_smoothing = max(args.label_smoothing, 0.05)
+            args.dropedge = max(args.dropedge, 0.2)
+            args.input_dropout = max(args.input_dropout, 0.1)
+            args.feature_noise = max(args.feature_noise, 0.01)
+            args.lambda_mix = min(args.lambda_mix, 1e-3)
+            args.mix_target = 0.8
+            args.lambda_w = max(args.lambda_w, 1e-3)
+            args.lambda_R = max(args.lambda_R, 1e-4)
+            args.w_max = min(args.w_max, 0.6)
+            args.exp_clip = min(args.exp_clip, 10.0)
 
     model = CertBP(
         in_dim=in_dim,
@@ -758,59 +599,58 @@ def train_one_run(args) -> None:
         num_classes=num_classes,
         edge_hidden_dim=args.edge_hidden_dim,
         dropout=args.dropout,
+        input_dropout=args.input_dropout,
         w_max=args.w_max,
         cmp_margin=args.cmp_margin,
         encoder_type=args.encoder,
         gat_heads=args.gat_heads,
         alpha_max=args.alpha_max,
         mix_init=args.mix_init,
+        msg_logit_init=args.msg_logit_init,
+        exp_clip=args.exp_clip,
+        feature_noise_std=args.feature_noise,
+        unary_temp=args.unary_temp,
     ).to(device)
 
-    opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    scheduler = None
+    if args.use_cosine:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=args.epochs, eta_min=args.lr * args.cosine_min_lr_scale
+        )
 
     inf_cfg_train = InferenceConfig(
         T=args.T,
         eta=args.eta,
         init_unary=not args.init_uniform,
-        adaptive_outer=args.adaptive_outer,
-        eta_min=args.eta_min,
-        eta_max=args.eta_max,
-        use_cert=args.use_cert,
-        cert_k=args.cert_k,
-        cert_eps_fd=args.cert_eps_fd,
-        use_uncert=args.use_uncert_train,
-        hutch_samples=args.hutch_samples,
-        hutch_eps_fd=args.hutch_eps_fd,
         alpha_scale=1.0,
     )
-
     inf_cfg_eval = InferenceConfig(
         T=args.T_eval,
         eta=args.eta,
         init_unary=not args.init_uniform,
-        adaptive_outer=args.adaptive_outer,
-        eta_min=args.eta_min,
-        eta_max=args.eta_max,
-        use_cert=args.use_cert,
-        cert_k=args.cert_k,
-        cert_eps_fd=args.cert_eps_fd,
-        use_uncert=args.use_uncert,
-        hutch_samples=args.hutch_samples,
-        hutch_eps_fd=args.hutch_eps_fd,
         alpha_scale=1.0,
     )
 
-    best_val = -1.0
+    best_score = None
     best_state = None
     patience = 0
 
     for epoch in range(1, args.epochs + 1):
-        inf_cfg_train.alpha_scale = 0.0 if epoch <= args.warmup else 1.0
+        if args.warmup <= 0:
+            inf_cfg_train.alpha_scale = 1.0
+        else:
+            inf_cfg_train.alpha_scale = min(1.0, float(epoch) / float(args.warmup))
+
+        ei_train, rev_train = data.edge_index, data.rev_edge
+        if args.dropedge > 0:
+            ei_train, rev_train = dropedge_undirected(data.edge_index, data.rev_edge, args.dropedge, data.num_nodes)
 
         model.train()
-        opt.zero_grad()
+        opt.zero_grad(set_to_none=True)
 
-        probs, _ = model(data, inf_cfg_train)
+        probs, ex = model(data, inf_cfg_train, edge_index=ei_train, rev=rev_train)
 
         nll = nll_with_label_smoothing(probs[train_mask], data.y[train_mask], args.label_smoothing)
 
@@ -830,41 +670,58 @@ def train_one_run(args) -> None:
         else:
             alpha_pen = torch.zeros([], device=device)
 
-        loss = nll + args.lambda_brier * brier + args.lambda_cmp * cmp_pen + args.lambda_alpha * alpha_pen
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
+        if args.lambda_mix > 0:
+            mix = torch.sigmoid(model.mix_logit)
+            mix_pen = (mix - args.mix_target).pow(2)
+        else:
+            mix_pen = torch.zeros([], device=device)
 
-        probs_eval, _ = predict_probs(model, data, inf_cfg_eval, args.mc_eval)
+        if args.lambda_w > 0:
+            w_pen = ex["w"].mean()
+        else:
+            w_pen = torch.zeros([], device=device)
+
+        if args.lambda_R > 0:
+            R_pen = model._sym_R().pow(2).mean()
+        else:
+            R_pen = torch.zeros([], device=device)
+
+        loss = (
+            nll
+            + args.lambda_brier * brier
+            + args.lambda_cmp * cmp_pen
+            + args.lambda_alpha * alpha_pen
+            + args.lambda_mix * mix_pen
+            + args.lambda_w * w_pen
+            + args.lambda_R * R_pen
+        )
+
+        if torch.isfinite(loss):
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+
+        if scheduler is not None:
+            scheduler.step()
+
+        probs_eval, _ = predict_probs(model, data, inf_cfg_eval, args.mc_eval, edge_index=data.edge_index, rev=data.rev_edge)
 
         tr_acc = accuracy(probs_eval, data.y, train_mask)
         va_acc = accuracy(probs_eval, data.y, val_mask)
         te_acc = accuracy(probs_eval, data.y, test_mask)
         va_ece = ece_score(probs_eval, data.y, val_mask, n_bins=15)
+        va_nll = nll_loss(probs_eval, data.y, val_mask)
 
-        va_metric = va_acc
-        te_metric = te_acc
+        if args.early_metric == "acc":
+            score = va_acc
+            improved = (best_score is None) or (score > best_score + 1e-12)
+        else:
+            score = -va_nll
+            improved = (best_score is None) or (score > best_score + 1e-12)
 
-        if post == "cs":
-            probs_eval_cs = correct_and_smooth(
-                probs_eval,
-                data.y,
-                train_mask,
-                data.edge_index,
-                data.num_nodes,
-                num_classes,
-                args.cs_correct_steps,
-                args.cs_correct_alpha,
-                args.cs_smooth_steps,
-                args.cs_smooth_alpha,
-            )
-            va_metric = accuracy(probs_eval_cs, data.y, val_mask)
-            te_metric = accuracy(probs_eval_cs, data.y, test_mask)
-
-        improved = va_metric > best_val + 1e-12
         if improved:
-            best_val = va_metric
-            best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            best_score = score
+            best_state = copy.deepcopy(model.state_dict())
             patience = 0
         else:
             patience += 1
@@ -875,8 +732,9 @@ def train_one_run(args) -> None:
             print(
                 f"[{args.dataset} split={args.split} seed={args.seed}] "
                 f"ep={epoch:04d} loss={loss.item():.4f} nll={nll.item():.4f} "
-                f"tr={tr_acc*100:.2f} va={va_acc*100:.2f} te={te_acc*100:.2f} vaECE={va_ece:.4f} "
-                f"alpha={alpha_val:.3f} mix={mix_val:.3f} post={post} vaM={va_metric*100:.2f} teM={te_metric*100:.2f}"
+                f"tr={tr_acc*100:.2f} va={va_acc*100:.2f} te={te_acc*100:.2f} "
+                f"vaNLL={va_nll:.4f} vaECE={va_ece:.4f} "
+                f"alpha={alpha_val:.3f} mix={mix_val:.3f} post={args.post}"
             )
 
         if patience >= args.patience:
@@ -885,46 +743,24 @@ def train_one_run(args) -> None:
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    probs_final, _ = predict_probs(model, data, inf_cfg_eval, args.mc_eval)
-    probs_out = probs_final
-    cs = args.cs_correct_steps
-    ca = args.cs_correct_alpha
-    ss = args.cs_smooth_steps
-    sa = args.cs_smooth_alpha
+    probs_final, _ = predict_probs(model, data, inf_cfg_eval, args.mc_eval, edge_index=data.edge_index, rev=data.rev_edge)
 
-    if post == "cs":
-        cs, ca, ss, sa = tune_cs_params(
-            probs_final,
-            data.y,
-            train_mask,
-            val_mask,
-            data.edge_index,
-            data.num_nodes,
-            num_classes,
-        )
-        probs_out = correct_and_smooth(
-            probs_final,
-            data.y,
-            train_mask,
-            data.edge_index,
-            data.num_nodes,
-            num_classes,
-            cs,
-            ca,
-            ss,
-            sa,
-        )
+    post = args.post
+    T = 1.0
+    if post == "ts":
+        T = fit_temperature(probs_final, data.y, val_mask)
+        probs_final = apply_temperature_scaling(probs_final, T)
 
-    te_acc = accuracy(probs_out, data.y, test_mask)
-    te_ece = ece_score(probs_out, data.y, test_mask, n_bins=15)
-    te_nll = F.nll_loss(torch.log(probs_out[test_mask].clamp(min=EPS)), data.y[test_mask]).item()
+    te_acc = accuracy(probs_final, data.y, test_mask)
+    te_ece = ece_score(probs_final, data.y, test_mask, n_bins=15)
+    te_nll = F.nll_loss(torch.log(probs_final[test_mask].clamp(min=EPS)), data.y[test_mask]).item()
     y_onehot = F.one_hot(data.y[test_mask], num_classes=num_classes).float()
-    te_brier = ((probs_out[test_mask] - y_onehot) ** 2).sum(dim=-1).mean().item()
+    te_brier = ((probs_final[test_mask] - y_onehot) ** 2).sum(dim=-1).mean().item()
 
+    extra_post = f"ts(T={T:.3f})" if post == "ts" else "none"
     print(
         f"\n[FINAL] {args.dataset} split={args.split} seed={args.seed} "
-        f"TEST Acc={te_acc*100:.2f} ECE={te_ece:.4f} NLL={te_nll:.4f} Brier={te_brier:.4f} post={post} "
-        f"cs_correct_steps={cs} cs_correct_alpha={ca} cs_smooth_steps={ss} cs_smooth_alpha={sa}"
+        f"TEST Acc={te_acc*100:.2f} ECE={te_ece:.4f} NLL={te_nll:.4f} Brier={te_brier:.4f} post={extra_post}"
     )
 
 
@@ -936,59 +772,68 @@ def main():
     p.add_argument("--split", type=int, default=0)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--deterministic", action="store_true")
 
-    p.add_argument("--encoder", type=str, default="gat", choices=["mlp", "gcn", "gat"])
+    p.add_argument("--auto_reg", dest="auto_reg", action="store_true", default=True)
+    p.add_argument("--no_auto_reg", dest="auto_reg", action="store_false")
+
+    p.add_argument("--normalize_features", dest="normalize_features", action="store_true", default=True)
+    p.add_argument("--no_normalize_features", dest="normalize_features", action="store_false")
+
+    p.add_argument("--use_cosine", dest="use_cosine", action="store_true", default=True)
+    p.add_argument("--no_use_cosine", dest="use_cosine", action="store_false")
+
+    p.add_argument("--encoder", type=str, default="auto", choices=["auto", "mlp", "gcn", "gat"])
     p.add_argument("--gat_heads", type=int, default=8)
 
     p.add_argument("--hidden_dim", type=int, default=64)
     p.add_argument("--edge_hidden_dim", type=int, default=64)
     p.add_argument("--dropout", type=float, default=0.6)
+    p.add_argument("--input_dropout", type=float, default=0.0)
+    p.add_argument("--feature_noise", type=float, default=0.0)
+
     p.add_argument("--w_max", type=float, default=0.8)
     p.add_argument("--cmp_margin", type=float, default=0.05)
     p.add_argument("--alpha_max", type=float, default=1.5)
-    p.add_argument("--mix_init", type=float, default=0.995)
+    p.add_argument("--mix_init", type=float, default=0.6)
+    p.add_argument("--msg_logit_init", type=float, default=-1.0)
+    p.add_argument("--exp_clip", type=float, default=20.0)
+    p.add_argument("--unary_temp", type=float, default=1.5)
 
     p.add_argument("--T", type=int, default=10)
     p.add_argument("--T_eval", type=int, default=20)
     p.add_argument("--eta", type=float, default=0.2)
     p.add_argument("--init_uniform", action="store_true")
 
-    p.add_argument("--adaptive_outer", type=int, default=1)
-    p.add_argument("--eta_min", type=float, default=0.05)
-    p.add_argument("--eta_max", type=float, default=0.8)
-
-    p.add_argument("--use_cert", action="store_true")
-    p.add_argument("--cert_k", type=int, default=10)
-    p.add_argument("--cert_eps_fd", type=float, default=1e-3)
-
-    p.add_argument("--use_uncert", action="store_true")
-    p.add_argument("--use_uncert_train", action="store_true")
-    p.add_argument("--hutch_samples", type=int, default=4)
-    p.add_argument("--hutch_eps_fd", type=float, default=1e-3)
-
     p.add_argument("--label_smoothing", type=float, default=0.0)
     p.add_argument("--lambda_brier", type=float, default=0.0)
     p.add_argument("--lambda_cmp", type=float, default=0.0)
     p.add_argument("--lambda_alpha", type=float, default=1e-3)
+    p.add_argument("--lambda_mix", type=float, default=1e-2)
+    p.add_argument("--mix_target", type=float, default=0.5)
+    p.add_argument("--lambda_w", type=float, default=0.0)
+    p.add_argument("--lambda_R", type=float, default=0.0)
 
-    p.add_argument("--warmup", type=int, default=100)
+    p.add_argument("--dropedge", type=float, default=0.0)
+
+    p.add_argument("--warmup", type=int, default=50)
     p.add_argument("--mc_eval", type=int, default=1)
 
-    p.add_argument("--post", type=str, default="auto", choices=["auto", "none", "cs"])
-    p.add_argument("--cs_correct_steps", type=int, default=50)
-    p.add_argument("--cs_correct_alpha", type=float, default=0.5)
-    p.add_argument("--cs_smooth_steps", type=int, default=50)
-    p.add_argument("--cs_smooth_alpha", type=float, default=0.8)
+    p.add_argument("--post", type=str, default="auto", choices=["auto", "none", "ts"])
+    p.add_argument("--early_metric", type=str, default="acc", choices=["acc", "nll"])
 
-    p.add_argument("--lr", type=float, default=0.005)
+    p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=5e-4)
-    p.add_argument("--epochs", type=int, default=3000)
+    p.add_argument("--epochs", type=int, default=1500)
     p.add_argument("--patience", type=int, default=300)
     p.add_argument("--log_every", type=int, default=50)
 
-    args = p.parse_args()
+    p.add_argument("--cosine_min_lr_scale", type=float, default=0.1)
 
-    set_seed(args.seed)
+    args = p.parse_args()
+    if args.post == "auto":
+        args.post = "none"
+
     train_one_run(args)
 
 
